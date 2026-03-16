@@ -180,6 +180,19 @@ func (c *client) SendRestorationStatus(ctx context.Context, backup string, succe
 	return nil
 }
 
+func (c *client) SetFileTransferStatus(ctx context.Context, transferID string, successful bool, errMsg string) error {
+	data := d{"successful": successful}
+	if !successful && errMsg != "" {
+		data["error"] = errMsg
+	}
+	resp, err := c.Post(ctx, fmt.Sprintf("/file-transfers/%s", transferID), data)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	return nil
+}
+
 // SendActivityLogs sends activity logs back to the Panel for processing.
 func (c *client) SendActivityLogs(ctx context.Context, activity []models.Activity) error {
 	resp, err := c.Post(ctx, "/activity", d{"data": activity})

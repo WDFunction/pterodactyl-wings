@@ -3,6 +3,7 @@ package router
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -626,4 +628,151 @@ func handleFileUpload(p string, s *server.Server, header *multipart.FileHeader) 
 		return err
 	}
 	return nil
+}
+
+func postServerPullFromS3(c *gin.Context) {
+	s := middleware.ExtractServer(c)
+	client := middleware.ExtractApiClient(c)
+	logger := middleware.ExtractLogger(c)
+
+	var data struct {
+		DownloadURL string `json:"download_url" binding:"required"`
+		Directory   string `json:"directory" binding:"required"`
+		Filename    string `json:"filename" binding:"required"`
+		TransferID  string `json:"transfer_id" binding:"required"`
+	}
+	if err := c.BindJSON(&data); err != nil {
+		return
+	}
+
+	logger.WithField("transfer_id", data.TransferID).Info("starting S3 file pull")
+
+	go func() {
+		successful := true
+		var errMsg string
+
+		defer func() {
+			if err := client.SetFileTransferStatus(s.Context(), data.TransferID, successful, errMsg); err != nil {
+				logger.WithField("transfer_id", data.TransferID).WithField("error", err).Error("failed to report file transfer status to Panel")
+			}
+		}()
+
+		httpClient := &http.Client{Timeout: time.Hour * 2}
+		req, err := http.NewRequestWithContext(s.Context(), http.MethodGet, data.DownloadURL, nil)
+		if err != nil {
+			successful = false
+			errMsg = "failed to create download request: " + err.Error()
+			logger.WithField("error", err).Error("S3 pull: failed to create request")
+			return
+		}
+
+		res, err := httpClient.Do(req)
+		if err != nil {
+			successful = false
+			errMsg = "failed to download from S3: " + err.Error()
+			logger.WithField("error", err).Error("S3 pull: failed to execute request")
+			return
+		}
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusOK {
+			successful = false
+			errMsg = fmt.Sprintf("S3 returned HTTP %d", res.StatusCode)
+			logger.WithField("status", res.StatusCode).Error("S3 pull: unexpected status code")
+			return
+		}
+
+		safeFilename := filepath.Base(data.Filename)
+		filePath := filepath.Join(data.Directory, safeFilename)
+		if err := s.Filesystem().IsIgnored(filePath); err != nil {
+			successful = false
+			errMsg = "file path is ignored: " + err.Error()
+			logger.WithField("error", err).Error("S3 pull: file path is ignored")
+			return
+		}
+
+		if err := s.Filesystem().Write(filePath, res.Body, res.ContentLength, 0o644); err != nil {
+			successful = false
+			errMsg = "failed to write file: " + err.Error()
+			logger.WithField("error", err).Error("S3 pull: failed to write file to disk")
+			return
+		}
+
+		logger.WithField("transfer_id", data.TransferID).WithField("file", filePath).Info("S3 file pull completed successfully")
+	}()
+
+	c.Status(http.StatusAccepted)
+}
+
+func postServerPushToS3(c *gin.Context) {
+	s := middleware.ExtractServer(c)
+	client := middleware.ExtractApiClient(c)
+	logger := middleware.ExtractLogger(c)
+
+	var data struct {
+		FilePath   string `json:"file_path" binding:"required"`
+		UploadURL  string `json:"upload_url" binding:"required"`
+		TransferID string `json:"transfer_id" binding:"required"`
+	}
+	if err := c.BindJSON(&data); err != nil {
+		return
+	}
+
+	logger.WithField("transfer_id", data.TransferID).Info("starting S3 file push")
+
+	go func() {
+		successful := true
+		var errMsg string
+
+		defer func() {
+			if err := client.SetFileTransferStatus(s.Context(), data.TransferID, successful, errMsg); err != nil {
+				logger.WithField("transfer_id", data.TransferID).WithField("error", err).Error("failed to report file transfer status to Panel")
+			}
+		}()
+
+		// TODO: safe?
+		reader, stat, err := s.Filesystem().File(data.FilePath)
+		if err != nil {
+			successful = false
+			errMsg = "failed to open file: " + err.Error()
+			logger.WithField("error", err).Error("S3 push: failed to open file")
+			return
+		}
+		defer reader.Close()
+
+		fileSize := stat.Size()
+
+		httpClient := &http.Client{Timeout: time.Hour * 2}
+		req, err := http.NewRequestWithContext(s.Context(), http.MethodPut, data.UploadURL, reader)
+		if err != nil {
+			successful = false
+			errMsg = "failed to create upload request: " + err.Error()
+			logger.WithField("error", err).Error("S3 push: failed to create request")
+			return
+		}
+
+		req.ContentLength = fileSize
+		req.Header.Set("Content-Length", strconv.FormatInt(fileSize, 10))
+		req.Header.Set("Content-Type", "application/octet-stream")
+
+		res, err := httpClient.Do(req)
+		if err != nil {
+			successful = false
+			errMsg = "failed to upload to S3: " + err.Error()
+			logger.WithField("error", err).Error("S3 push: failed to execute request")
+			return
+		}
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusCreated {
+			successful = false
+			errMsg = fmt.Sprintf("S3 returned HTTP %d", res.StatusCode)
+			logger.WithField("status", res.StatusCode).Error("S3 push: unexpected status code")
+			return
+		}
+
+		logger.WithField("transfer_id", data.TransferID).WithField("file", data.FilePath).Info("S3 file push completed successfully")
+	}()
+
+	c.Status(http.StatusAccepted)
 }
