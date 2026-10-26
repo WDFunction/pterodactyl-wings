@@ -77,6 +77,10 @@ func (c backupTestRemoteClient) SetTransferStatus(context.Context, string, bool)
 	return nil
 }
 
+func (c backupTestRemoteClient) SetFileTransferStatus(context.Context, string, bool, string) error {
+	return nil
+}
+
 func (c backupTestRemoteClient) ValidateSftpCredentials(context.Context, remote.SftpAuthRequest) (remote.SftpAuthResponse, error) {
 	return remote.SftpAuthResponse{}, nil
 }
